@@ -117,7 +117,8 @@ class RecitationSession(
         }
         record = rec
         capturing = true
-        connect()                     // الالتقاط يبدأ عند وصول «ready» من الخادم (انظر beginCapture)
+        connect()                     // الخادم يستيقظ الآن؛ الصوت يُخزَّن في صندوق الإرسال ويُرسل فور فتح الاتصال
+        beginCapture()
         return true
     }
 

@@ -73,7 +73,7 @@ except ImportError:  # pragma: no cover
 # ==============================================================================
 USE_MEMORY_SNAPSHOT = True   # Modal restores a snapshot of the loaded model: near-instant cold start
 USE_GPU = False          # set True ONLY after you add a card to Modal (T4 GPU = ~10x faster)
-PRECISION = "auto"       # "auto": int8 only if fp32 is far too slow (rtf > AUTO_INT8_ABOVE_RTF) | "fp32" | "int8"
+PRECISION = "int8"       # "auto": int8 only if fp32 is far too slow (rtf > AUTO_INT8_ABOVE_RTF) | "fp32" | "int8"
 AUTO_INT8_ABOVE_RTF = 0.60
 MODEL_ID = "obadx/muaalem-model-v3_2"
 APP_NAME = "rafiq-quran-muaalem-backend"
@@ -84,7 +84,7 @@ DEFAULT_SURA, DEFAULT_AYA = 2, 255
 # ==============================================================================
 SR = 16000
 FRAME = 320                       # 20 ms analysis frame
-HOP_S = float(os.environ.get("RAFIQ_HOP_S", "0.16"))   # run the model when this much new audio arrived (160 ms; see dev/cost_proof.py)
+HOP_S = float(os.environ.get("RAFIQ_HOP_S", "0.32"))   # run the model when this much new audio arrived (160 ms; see dev/cost_proof.py)
 HOP_SLOW_S = max(HOP_S, 0.20)                           # ...and 200 ms when the server is slow (rtf > 0.5)
 MIN_VOICED_S = 0.30               # ...and the window contains at least this much speech
 MIN_NEW_VOICED_S = 0.10           # ...of which this much is new
@@ -1145,12 +1145,9 @@ def madd_bounds(exp: str, s: int, e: int) -> Tuple[int, int]:
 def madd_policy(kind: str, lo: int, hi: int, preset: Preset) -> Tuple[int, int, int, int]:
     """-> (lo, hi, short_slack, long_slack) actually enforced for this preset.
       * madd muttasil is 4..6 harakat in EVERY preset: the preset slacks never apply to it.
-      * in `strict`, madd munfasil / silah kubra follow the reference's configured length (4, or 5): the qasr (2)
-        and 3-harakat readings that balanced / relaxed accept are flagged."""
+      * madd munfasil / silah kubra accept 2 (qasr) .. 5 harakat in EVERY preset, strict included."""
     if kind == "muttasil":
         return MUTTASIL_LO, MUTTASIL_HI, 0, 0
-    if kind == "munfasil" and preset.name == "strict":
-        return 4, 5, 0, 0
     return lo, hi, preset.short_slack, preset.long_slack
 
 

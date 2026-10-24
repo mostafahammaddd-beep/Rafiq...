@@ -384,17 +384,16 @@ def mkk(exp, seg, p): return [i.k for i in M.judge_word([exp], seg, None, p)[0]]
 # madd munfasil / silah kubra: balanced + relaxed accept 2 (qasr) .. 5 (Hafs 'an 'Asim); v14.5 STRICT follows the
 # reference's configured length (4 or 5) and flags qasr / 3 harakat (live report #2 w1 and w36)
 munf = "لَاااا"
-check("v14.5 strict: madd munfasil with 2 harakat (qasr) is flagged madd_short; balanced and relaxed still accept it",
-      mkk(munf, "لَاا", S_) == ["madd_short"] and mkk(munf, "لَاا", B_) == [] and mkk(munf, "لَاا", R_) == [])
-check("v14.5 strict: madd munfasil with 3 harakat is flagged; 4 and 5 are valid", mkk(munf, "لَاا" + "ا", S_) == ["madd_short"]
-      and all(mkk(munf, "لَ" + "ا" * n, S_) == [] for n in (4, 5)))
+check("madd munfasil with 2 harakat (qasr) is accepted in every preset, strict included",
+      mkk(munf, "لَاا", S_) == [] and mkk(munf, "لَاا", B_) == [] and mkk(munf, "لَاا", R_) == [])
+check("madd munfasil with 3, 4 and 5 harakat is valid in strict", all(mkk(munf, "لَ" + "ا" * n, S_) == [] for n in (3, 4, 5)))
 check("hafs: madd munfasil dropped to 1 harakah is an error", mkk(munf, "لَا", S_) == ["madd_short"])
 check("hafs: madd munfasil stretched past 5: strict flags 6, balanced tolerates 6 but flags 7",
       mkk(munf, "لَ" + "ا" * 6, S_) == ["madd_long"] and mkk(munf, "لَ" + "ا" * 6, B_) == []
       and mkk(munf, "لَ" + "ا" * 7, B_) == ["madd_long"])
 silah = "عِںںںدَهُۥۥۥۥ"
-check("v14.5 strict: silah kubra with 2 harakat is flagged (live report #2 w36 pattern); balanced and relaxed accept it",
-      mkk(silah, "عِںںںدَهُۥۥ", S_) == ["madd_short"] and mkk(silah, "عِںںںدَهُۥۥ", B_) == [] and mkk(silah, "عِںںںدَهُۥۥ", R_) == [])
+check("silah kubra with 2 harakat is accepted in every preset, strict included",
+      mkk(silah, "عِںںںدَهُۥۥ", S_) == [] and mkk(silah, "عِںںںدَهُۥۥ", B_) == [] and mkk(silah, "عِںںںدَهُۥۥ", R_) == [])
 check("hafs: madd muttasil still needs 4 (2 is an error)", mkk("شَااااءَ", "شَااءَ", S_) == ["madd_short"] and mkk("شَااااءَ", "شَااااءَ", S_) == [])
 arid = "لعَظِۦۦۦۦم"
 check("hafs: madd 'arid at a stop is valid at 2, 4 and 6 (7 flagged)",

@@ -133,11 +133,10 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
             return
         }
         session = s
-        val warm = serverState == 1
-        stage = Stage.STARTING
-        glow = -1
+        stage = Stage.LISTENING
+        glow = 0
         if (serverState == 3) serverState = 0
-        message = if (warm) "جارٍ الاتصال بالخادم…" else "الخادم يستيقظ… انتظر لحظات (حتى نصف دقيقة) ثم ابدأ التلاوة"
+        message = "تفضّل بالتلاوة…"
     }
 
     fun stopRecitation() {
@@ -305,7 +304,7 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
         val base = max(0, max(serverTracked, serverCommitted)).coerceAtMost(last)
         val s = session
         val voicedAfter = if (s != null) s.voicedSinceMs(serverAudioMs) else 0L
-        val extra = floor(pace * voicedAfter / 1000.0).toInt().coerceIn(0, 2)
+        val extra = floor(pace * voicedAfter / 1000.0).toInt().coerceIn(0, 6)
         val cand = (base + extra).coerceAtMost(last)
         glow = if (cand >= glow) cand else if (silentMs >= 700) cand else glow
     }
