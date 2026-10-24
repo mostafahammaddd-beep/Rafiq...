@@ -1,0 +1,13 @@
+# For run_local.py (your own PC). Windows installs the CPU build of torch by default.
+torch
+transformers>=4.45.0,<5.0.0
+accelerate
+quran-muaalem>=0.2.2
+quran-transcript
+librosa
+fastapi[standard]
+websockets
+numba>=0.61.2
+soundfile
+numpy
+orjson

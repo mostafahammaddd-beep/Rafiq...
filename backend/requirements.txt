@@ -1,0 +1,4 @@
+# Only what is needed on YOUR computer to run:  py -m modal deploy modal_app.py
+# (the heavy AI libraries are installed inside Modal's cloud image automatically)
+modal>=0.73.0
+numpy
