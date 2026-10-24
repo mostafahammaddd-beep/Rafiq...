@@ -1,0 +1,28 @@
+name: Build APK
+on: [push, workflow_dispatch]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: 8.7 }
+      - name: Build Android APK
+        working-directory: android
+        run: gradle assembleDebug --no-daemon
+      - name: Show APK size
+        run: ls -lh android/app/build/outputs/apk/debug/*.apk
+      - uses: actions/upload-artifact@v6
+        with:
+          name: Rafiq-APK
+          path: android/app/build/outputs/apk/debug/*.apk
+      - uses: softprops/action-gh-release@v2
+        continue-on-error: true
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Rafiq build ${{ github.run_number }}
+          files: android/app/build/outputs/apk/debug/*.apk
