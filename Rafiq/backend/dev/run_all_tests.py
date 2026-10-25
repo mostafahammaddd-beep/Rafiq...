@@ -367,6 +367,7 @@ def all_keys(o, acc):
 server_keys = set()
 for m_ in msgs: all_keys(m_, server_keys)
 server_keys |= {"words", "type", "resume_word_idx"}   # 'ready' carries the word list, 'paused_idle' the checkpoint (both exercised by the websocket tests)
+server_keys |= {"reason"}   # key of the JSON body of the HTTP 403 handshake refusal (asserted in dev/test_security.py section 4b)
 final_msg = dict(eng.final_message()); final_msg["debug"] = M.debug_snapshot(eng, sim_runtime := types.SimpleNamespace(status=lambda: {}))
 all_keys(final_msg, server_keys)
 missing = sorted(k for k in kotlin_keys if k not in server_keys and k != "message")
@@ -1055,6 +1056,36 @@ check("batch mode is gone from the backend: no /analyze, no upload parsing, no o
 res = subprocess.run([sys.executable, os.path.join(HERE, "static_check_kt.py")], capture_output=True, text=True)
 check("kotlin static check: balanced, no batch symbols (uploadBatch, buildWav, KEY_MODE, getMode, saveMode), every used member exists, listener parity, JSON key parity with Python",
       res.returncode == 0, res.stdout[-600:])
+# ---- client reconnect policy + no warm-up traffic (Kotlin cannot be compiled here: these are SOURCE assertions)
+ctrl_kt = open(os.path.join(kt_dir, "RafiqController.kt"), encoding="utf-8").read()
+main_kt = open(os.path.join(kt_dir, "MainActivity.kt"), encoding="utf-8").read()
+def kconst(name):
+    mm = _re.search(r"const val %s\s*=\s*([0-9_]+)L?" % name, kt)
+    return int(mm.group(1).replace("_", "")) if mm else None
+MAXR, BASE_MS = kconst("MAX_RETRIES"), kconst("RETRY_BASE_MS")
+schedule = [BASE_MS << (n - 1) for n in range(1, (MAXR or 0) + 1)]           # the exact expression onSocketGone uses: RETRY_BASE_MS shl (attempts - 1)
+check("client: at most 3 reconnect attempts with exponential back-off 1 s, 2 s, 4 s (constants parsed from RecitationSession.kt)",
+      MAXR == 3 and schedule == [1000, 2000, 4000] and "RETRY_BASE_MS shl (attempts - 1)" in kt and "attempts > MAX_RETRIES" in kt, (MAXR, BASE_MS, schedule))
+check("client: the whole back-off (%d ms) fits inside the server's scaledown_window (%d s): a retry meets the same warm container" % (sum(schedule), M.MODAL_SCALEDOWN_S),
+      sum(schedule) < M.MODAL_SCALEDOWN_S * 1000, (schedule, M.MODAL_SCALEDOWN_S))
+ready_branch = kt.split('"ready" -> {', 1)[1].split('"progress" ->', 1)[0]
+check("client: receiving 'ready' does NOT reset the retry budget (a server that says ready and then drops used to loop forever)",
+      "attempts = 0" not in ready_branch and "readyAtMs = SystemClock.elapsedRealtime()" in ready_branch)
+sgone = kt.split("private fun onSocketGone", 1)[1].split("/** يرسل إطار resume", 1)[0]
+check("client: the budget is renewed only after a connection that stayed up STABLE_MS, and the session has an absolute retry ceiling",
+      "STABLE_MS" in sgone and "attempts = 0" in sgone and "MAX_RETRIES_PER_SESSION" in sgone and (kconst("MAX_RETRIES_PER_SESSION") or 99) <= 10 and "attempts > 8" not in kt)
+fail_cb = kt.split("override fun onFailure", 1)[1].split("private fun denialReason", 1)[0]
+check("client: a handshake 401/403 or other 4xx is fatal at once (no retry); the reason code in the 403 body selects the message",
+      "http == 401 || http == 403" in fail_cb and "fatal(authMessage(why))" in fail_cb and "400..499" in fail_cb and "denialReason(response)" in fail_cb
+      and all(r_ in kt for r_ in ("token_missing", "token_expired", "token_invalid", "server_auth_unconfigured")))
+check("client: the reason codes the app understands are exactly the ones the server sends", set(M.REJECT_PUBLIC.values()) == {"token_missing", "token_expired", "token_invalid", "server_auth_unconfigured"})
+check("client: close codes 1008 / 1009 are not retried; callbacks of superseded sockets are ignored (generation counter)",
+      "code == 1008 || code == 1009" in kt and kt.count("gen != connGen.get()") >= 5 and "connGen.incrementAndGet()" in kt.split("fun abort()", 1)[1].split("fun voicedSinceMs", 1)[0])
+check("client: with no saved token the metered server is not contacted at all (it would only start a container to be refused)",
+      "token.isEmpty() && RecitationConfig.isMetered(appContext)" in kt.split("private fun connect()", 1)[1].split("val url =", 1)[0])
+check("client: no warm-up traffic - the /health polling loop is gone; nothing calls the server before the record button is pressed",
+      "fun warmUp" not in ctrl_kt and "healthUrl" not in ctrl_kt and "tries < 120" not in ctrl_kt and "warmUp" not in main_kt and "retryServer" not in (ctrl_kt + main_kt)
+      and "markSleeping()" in main_kt)
 gradle = open(os.path.join(HERE, "..", "..", "android", "app", "build.gradle.kts"), encoding="utf-8").read()
 check("versions: engine rafiq-v14.6, versionCode 19, versionName 14.6",
       M.ENGINE_NAME == "rafiq-v14.6" and M.VERSION == "14.6" and "versionCode = 19" in gradle and 'versionName = "14.6"' in gradle and "14.4" not in py_src.split("class QuranLib")[0])
@@ -1091,8 +1122,21 @@ def load_with_fake_modal():
         else: sys.modules["modal"] = saved
     return mod, rec
 mod, rec = load_with_fake_modal(); kw = rec["cls_kwargs"]
-check("modal config: cpu=(0.125, 2.0), memory tuple, scaledown_window=2, memory snapshot on, timeout set",
-      kw["cpu"] == (0.125, 2.0) and isinstance(kw["memory"], tuple) and kw["scaledown_window"] == 2 and kw["enable_memory_snapshot"] is True, kw)
+check("modal config: cpu=(0.125, 2.0), memory tuple, scaledown_window=20, memory snapshot on, timeout set",
+      kw["cpu"] == (0.125, 2.0) and isinstance(kw["memory"], tuple) and kw["scaledown_window"] == 20 and kw["enable_memory_snapshot"] is True, kw)
+check("modal config: idle cost is controlled ONLY by the short scaledown_window - no keep-warm / minimum / buffer containers",
+      not any(k in kw for k in ("min_containers", "keep_warm", "buffer_containers", "max_containers")) and kw["scaledown_window"] <= 30, kw)
+_saved_sd = os.environ.get("RAFIQ_SCALEDOWN_S")
+try:
+    os.environ["RAFIQ_SCALEDOWN_S"] = "0"; low = load_with_fake_modal()[1]["cls_kwargs"]["scaledown_window"]
+    os.environ["RAFIQ_SCALEDOWN_S"] = "99999"; high = load_with_fake_modal()[1]["cls_kwargs"]["scaledown_window"]
+finally:
+    if _saved_sd is None: os.environ.pop("RAFIQ_SCALEDOWN_S", None)
+    else: os.environ["RAFIQ_SCALEDOWN_S"] = _saved_sd
+check("modal config: RAFIQ_SCALEDOWN_S override is clamped to Modal's sane range (2 .. 600 s)", (low, high) == (2, 600), (low, high))
+rf = [c for c in rec["image"].calls if c[0] == "run_function"]
+check("image build: the weights step runs as run_function with enough memory for fp32 + INT8 copies (>= 6 GiB) and a generous timeout",
+      len(rf) == 1 and rf[0][1][0].__name__ == "download_muaalem_weights" and rf[0][2].get("memory", 0) >= 6144 and rf[0][2].get("timeout", 0) >= 900, rf)
 check("modal config: default (pre-emptible) capacity and NO region pinning (no 3x / 1.75x surcharge): neither `nonpreemptible` nor `region` is passed",
       "nonpreemptible" not in kw and "region" not in kw and "gpu" not in kw)
 check("modal config: @modal.concurrent(max_inputs=16) with one live session per container target", rec["concurrent"]["max_inputs"] == 16 and rec["concurrent"]["target_inputs"] == 1, rec["concurrent"])
@@ -1116,6 +1160,176 @@ import gc as _gc
 frozen_before = _gc.get_freeze_count(); real_rt = mod.ModelRuntime(); real_rt.snapshot_prepare()
 check("snapshot_prepare really freezes the heap (gc.freeze) and survives a missing libc.so.6", _gc.get_freeze_count() >= frozen_before)
 _gc.unfreeze()
+
+# ---------------------------------------------------------------- start-up never quantises; INT8 is built ONCE at image build
+import contextlib, io, shutil, tempfile
+from unittest import mock
+
+
+class _Model:                                   # stands in for a torch module
+    def __init__(self, tag): self.tag, self.training = tag, True
+    def eval(self): self.training = False; return self
+
+
+class _FakeEnv:
+    """Injects fake torch / quran_muaalem / quran_transcript so the REAL ModelRuntime and build code run without them.
+    `calls` collects everything that would be quantisation or benchmarking."""
+    def __init__(self, torch_version="2.9.9+cpu", cuda=False, load_raises=None):
+        self.calls, self.loaded, self.saved, self.muaalem = [], [], [], None
+        env = self
+        t = types.ModuleType("torch"); t.__version__ = torch_version
+        t.set_num_threads = lambda n: None; t.set_num_interop_threads = lambda n: None
+        t.cuda = types.SimpleNamespace(is_available=lambda: cuda)
+        t.float32, t.bfloat16, t.qint8 = "float32", "bfloat16", "qint8"
+        def _quantize_dynamic(*a, **k): env.calls.append("torch.quantize_dynamic"); return _Model("q")
+        t.ao = types.SimpleNamespace(quantization=types.SimpleNamespace(quantize_dynamic=_quantize_dynamic)); t.quantization = t.ao.quantization
+        def _load(path, **kw):
+            env.loaded.append((path, kw))
+            if load_raises: raise load_raises
+            return _Model("int8-from-disk")
+        def _save(obj, path):
+            env.saved.append(path)
+            with open(path, "wb") as fh: fh.write(b"Q" * 64)
+        t.load, t.save = _load, _save
+        mu = types.ModuleType("quran_muaalem")
+        class Muaalem:
+            def __init__(s, model_name_or_path=None, device="cpu", dtype=None):
+                s.model, s.device = _Model("fp32"), device; env.muaalem = s
+        mu.Muaalem = Muaalem
+        qt = types.ModuleType("quran_transcript")
+        qt.MoshafAttributes = lambda **k: k
+        qt.quran_phonetizer = lambda *a, **k: None
+        qt.Aya = lambda su, ay: types.SimpleNamespace(get=lambda: types.SimpleNamespace(uthmani="x"))
+        self.mods = {"torch": t, "quran_muaalem": mu, "quran_transcript": qt}
+    def __enter__(self):
+        self._old = {k: sys.modules.get(k) for k in self.mods}; sys.modules.update(self.mods); return self
+    def __exit__(self, *a):
+        for k, v in self._old.items():
+            if v is None: sys.modules.pop(k, None)
+            else: sys.modules[k] = v
+
+
+def start_runtime(env, qdir, precision="auto"):
+    """Runs the real ModelRuntime.ensure_loaded(); any call to a quantise / benchmark helper is recorded in env.calls."""
+    trap = lambda name: (lambda *a, **k: (env.calls.append(name), a[-1] if a else None)[1])   # records the call, hands the model back unchanged
+    with contextlib.redirect_stdout(io.StringIO()), env, mock.patch.object(M, "QUANT_DIR", qdir), mock.patch.object(M, "PRECISION", precision), \
+            mock.patch.object(M.ModelRuntime, "_probe_internals", lambda self, m: {}), \
+            mock.patch.object(M.ModelRuntime, "get_ref", lambda self, su, ay: None), \
+            mock.patch.object(M.ModelRuntime, "_quantize_encoder_only", trap("_quantize_encoder_only")), \
+            mock.patch.object(M.ModelRuntime, "_quant_close", trap("_quant_close")), \
+            mock.patch.object(M.ModelRuntime, "_time_inference", trap("_time_inference")):
+        rt = M.ModelRuntime(); rt.ensure_loaded()
+    return rt
+
+
+def write_artifact(qdir, **over):
+    meta = {"format": M.QUANT_FORMAT, "model_id": M.MODEL_ID, "torch": "2.9.9+cpu", "int8": True, "bytes": 64,
+            "scope": "encoder-linear", "layers": 24, "min_logit_cosine": 0.999, "cosine_checked": True}
+    meta.update(over)
+    with open(os.path.join(qdir, M.QUANT_META_FILE), "w", encoding="utf-8") as fh: json.dump(meta, fh)
+    with open(os.path.join(qdir, M.QUANT_MODEL_FILE), "wb") as fh: fh.write(b"Q" * 64)
+
+
+def run_builder(qdir, cos_seq, rtfs, precision="auto", quant_raises=None):
+    env, cos, rt_it = _FakeEnv(), iter(cos_seq), iter(rtfs)
+    def fake_quantize(self, model):
+        if quant_raises: raise quant_raises
+        self.quant_info = {"scope": "encoder-linear", "layers": 24}; return _Model("q")
+    with contextlib.redirect_stdout(io.StringIO()), env, mock.patch.object(M, "PRECISION", precision), mock.patch.object(M, "QuranLib", lambda: object()), \
+            mock.patch.object(M.ModelRuntime, "get_ref", lambda self, su, ay: "REF"), \
+            mock.patch.object(M.ModelRuntime, "_quantize_encoder_only", fake_quantize), \
+            mock.patch.object(M.ModelRuntime, "_quant_close", lambda self, m, a, b: next(cos)), \
+            mock.patch.object(M.ModelRuntime, "_time_inference", lambda self, m, ref, seconds=3.0: next(rt_it)):
+        m = types.SimpleNamespace(model=_Model("fp32")); fp32 = m.model
+        meta = M.build_prequantized_artifact(m, qdir)
+    return meta, m, fp32, env
+
+
+_tmp = tempfile.mkdtemp(prefix="rafiq_quant_")
+try:
+    # --- start-up with a valid image artifact: loads it, and quantises / benchmarks NOTHING
+    d = os.path.join(_tmp, "ok"); os.makedirs(d); write_artifact(d)
+    env = _FakeEnv(); rt_ = start_runtime(env, d)
+    check("start-up with the image's INT8 artifact: the quantised model is swapped in, flagged int8, source=image-artifact",
+          rt_.int8 is True and rt_.muaalem.model.tag == "int8-from-disk" and rt_.muaalem.model.training is False
+          and rt_.quant_info.get("source") == "image-artifact" and rt_.quant_info.get("layers") == 24, (rt_.int8, rt_.quant_info))
+    check("start-up NEVER quantises or benchmarks (no quantize_dynamic, no logit-cosine check, no fp32-vs-int8 timing) - this was the 75 s",
+          env.calls == [] and len(env.loaded) == 1 and env.loaded[0][0].endswith(M.QUANT_MODEL_FILE) and env.loaded[0][1].get("weights_only") is False, (env.calls, env.loaded))
+    check("start-up records per-stage timings (fp32 load, INT8 load, total) for the log and /admin/health",
+          {"fp32_load_s", "int8_load_s", "total_s", "probe_s"} <= set(rt_.timings) and rt_.status()["quant"]["source"] == "image-artifact", rt_.timings)
+
+    # --- every way the artifact can be unusable: fp32, no crash, still no quantisation, the reason is recorded
+    cases = [
+        ("no artifact in the image", None, {}, "no pre-quantised artifact"),
+        ("build rejected int8", "w", {"int8": False, "reason": "logits drifted"}, "logits drifted"),
+        ("built with another torch", "w", {"torch": "1.0.0"}, "built with torch"),
+        ("built for another model", "w", {"model_id": "someone/else"}, "built for model"),
+        ("old artifact format", "w", {"format": 0}, "format"),
+        ("truncated file (size != meta)", "w", {"bytes": 999}, "truncated"),
+    ]
+    for label, mode, over, why in cases:
+        d = os.path.join(_tmp, label.replace(" ", "_")); os.makedirs(d)
+        if mode: write_artifact(d, **over)
+        env = _FakeEnv(); rt_ = start_runtime(env, d)
+        check("artifact unusable (%s): stays fp32, server still comes up, reason recorded, nothing quantised at start-up" % label,
+              rt_.muaalem is not None and rt_.int8 is False and rt_.muaalem.model.tag == "fp32" and why in rt_.quant_info.get("reason", "")
+              and env.calls == [] and env.loaded == [], (rt_.quant_info, env.calls, env.loaded))
+    d = os.path.join(_tmp, "corrupt"); os.makedirs(d); write_artifact(d)
+    env = _FakeEnv(load_raises=RuntimeError("unpickling failed")); rt_ = start_runtime(env, d)
+    check("artifact that fails to deserialise: falls back to fp32 instead of crashing the container", rt_.int8 is False and rt_.muaalem.model.tag == "fp32"
+          and "unpickling failed" in rt_.quant_info.get("error", "") and env.calls == [], rt_.quant_info)
+    d = os.path.join(_tmp, "p32"); os.makedirs(d); write_artifact(d)
+    env = _FakeEnv(); rt_ = start_runtime(env, d, precision="fp32")
+    check("PRECISION='fp32': the artifact is ignored", rt_.int8 is False and env.loaded == [] and rt_.quant_info.get("reason") == "PRECISION=fp32")
+    d = os.path.join(_tmp, "gpu"); os.makedirs(d); write_artifact(d)
+    env = _FakeEnv(cuda=True); rt_ = start_runtime(env, d)
+    check("GPU: dynamic INT8 is CPU-only, so the artifact is not used", rt_.device == "cuda" and rt_.int8 is False and env.loaded == [])
+    import ast as _ast, inspect, textwrap
+    def _code_names(fn):                          # identifiers actually used in the CODE (docstrings / comments excluded)
+        tree = _ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        return {n.id for n in _ast.walk(tree) if isinstance(n, _ast.Name)} | {n.attr for n in _ast.walk(tree) if isinstance(n, _ast.Attribute)}
+    used_ = _code_names(M.ModelRuntime.ensure_loaded) | _code_names(M.ModelRuntime._use_prequantized)
+    bad_ = used_ & {"quantize_dynamic", "_quantize_encoder_only", "_tune_precision", "_time_inference", "_quant_close", "measure_rtf"}
+    check("source guard: the code of ensure_loaded / _use_prequantized uses no quantize_dynamic, _quantize_encoder_only, _tune_precision or timing helper",
+          not bad_ and "_use_prequantized" in used_, bad_)
+
+    # --- image-build step: what it keeps and what it rejects
+    d = os.path.join(_tmp, "b_ok"); meta, m_, fp32, benv = run_builder(d, [0.995, 0.99999], [0.50, 0.30])
+    on_disk = json.load(open(os.path.join(d, M.QUANT_META_FILE)))
+    check("build: good logits + faster + faithful reload -> INT8 file and meta written, bench recorded, fp32 model left on m",
+          meta["int8"] is True and os.path.getsize(os.path.join(d, M.QUANT_MODEL_FILE)) == meta["bytes"] == 64 and on_disk == meta
+          and meta["bench"]["int8_rtf"] < meta["bench"]["fp32_rtf"] and m_.model is fp32 and meta["min_logit_cosine"] == 0.995, meta)
+    env = _FakeEnv(); rt_ = start_runtime(env, d)
+    check("build -> start-up contract: the artifact the build step wrote is accepted by the loader (schema, torch version, size)",
+          rt_.int8 is True and rt_.quant_info["source"] == "image-artifact" and env.calls == [])
+    d = os.path.join(_tmp, "b_drift"); meta, *_ = run_builder(d, [0.90], [0.5])
+    check("build: logits drift (cosine 0.90 < 0.985) -> fp32 kept, no model file, reason written",
+          meta["int8"] is False and "drifted" in meta["reason"] and not os.path.exists(os.path.join(d, M.QUANT_MODEL_FILE)) and os.path.exists(os.path.join(d, M.QUANT_META_FILE)), meta)
+    d = os.path.join(_tmp, "b_slow"); meta, *_ = run_builder(d, [0.995], [0.50, 0.70])
+    check("build: INT8 slower than fp32 on the build host -> fp32 kept", meta["int8"] is False and "slower" in meta["reason"] and not os.path.exists(os.path.join(d, M.QUANT_MODEL_FILE)), meta)
+    d = os.path.join(_tmp, "b_reload"); meta, *_ = run_builder(d, [0.995, 0.5], [0.5, 0.3])
+    check("build: a saved file that does not reproduce the in-memory model is deleted and rejected",
+          meta["int8"] is False and "does not reproduce" in meta["reason"] and not os.path.exists(os.path.join(d, M.QUANT_MODEL_FILE)), meta)
+    d = os.path.join(_tmp, "b_exc"); meta, *_ = run_builder(d, [], [0.5], quant_raises=RuntimeError("no fbgemm"))
+    check("build: an exception never fails the image build; meta says why", meta["int8"] is False and "no fbgemm" in meta["reason"] and os.path.exists(os.path.join(d, M.QUANT_META_FILE)), meta)
+    d = os.path.join(_tmp, "b_unverifiable"); meta, *_ = run_builder(d, [None, None], [0.5, 0.3])
+    check("build: if the logit check cannot run (library internals changed) the artifact is kept but honestly marked cosine_checked=false",
+          meta["int8"] is True and meta["cosine_checked"] is False and meta["min_logit_cosine"] is None, meta)
+    d = os.path.join(_tmp, "b_stale"); os.makedirs(d); write_artifact(d)
+    meta, *_ = run_builder(d, [], [], precision="fp32")
+    check("build: a stale artifact from an earlier layer is removed before anything else (PRECISION='fp32' -> no model file)",
+          meta["int8"] is False and meta["reason"] == "PRECISION=fp32" and not os.path.exists(os.path.join(d, M.QUANT_MODEL_FILE)))
+
+    # --- the Modal image function really calls the build step (CPU only)
+    calls_ = []
+    for cuda_ in (False, True):
+        with _FakeEnv(cuda=cuda_) as fe, mock.patch.object(mod, "build_prequantized_artifact", lambda m, *a, **k: calls_.append((cuda_, m))):
+            mod.download_muaalem_weights()
+    check("image function download_muaalem_weights: loads the model once, calls the pre-quantisation step on CPU and skips it on a GPU image",
+          len(calls_) == 1 and calls_[0][0] is False and calls_[0][1].model.tag == "fp32", calls_)
+finally:
+    shutil.rmtree(_tmp, ignore_errors=True)
+
 res = subprocess.run([sys.executable, os.path.join(HERE, "cost_proof.py"), "--redundancy", "2.2"], capture_output=True, text=True)
 check("cost script runs and prints the breakdown (reservation, burst, RAM) and a verdict", res.returncode == 0 and "CPU reserv." in res.stdout and "VERDICT" in res.stdout and "CPU burst" in res.stdout, res.stderr[-300:])
 

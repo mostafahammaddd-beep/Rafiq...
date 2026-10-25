@@ -11,6 +11,10 @@ The signing secret is read from the ENVIRONMENT, never from the command line (sh
     export RAFIQ_AUTH_SECRET=<that value>            # Windows cmd:  set RAFIQ_AUTH_SECRET=<that value>
     python tools/issue_token.py --sub student-017 --days 30
 
+If the app is refused with 403, compare fingerprints (neither command prints the secret itself):
+    python tools/issue_token.py --fingerprint        # your RAFIQ_AUTH_SECRET
+    modal app logs rafiq-quran-muaalem-backend       # look for  [rafiq][boot] ... server_secret_fp=xxxxxxxx  and  [rafiq][ws-reject] ...
+
 Give the printed token to that person; they paste it in the app under  ⚙ -> رمز الدخول.
 A token is a bearer credential: anyone holding it can use the server until it expires. Use short lifetimes for
 children's devices, one subject per person (the server limits each subject to 2 concurrent sessions), and rotate
@@ -30,6 +34,8 @@ def main() -> int:
     ap.add_argument("--new-secret", action="store_true", help="print a fresh random secret (for RAFIQ_AUTH_SECRET / RAFIQ_ADMIN_TOKEN) and exit")
     ap.add_argument("--sub", help="subject: who the token is for, [A-Za-z0-9_.:@-]{1,64} (no real names needed)")
     ap.add_argument("--days", type=float, default=30.0, help="lifetime in days (default 30, max 366)")
+    ap.add_argument("--fingerprint", action="store_true",
+                    help="print the fingerprint of %s and exit; it must equal server_secret_fp in the Modal logs" % m.ENV_AUTH_SECRET)
     a = ap.parse_args()
     if a.new_secret:
         print(secrets.token_urlsafe(48))
@@ -38,14 +44,24 @@ def main() -> int:
     if not secret:
         print("error: set %s in the environment first (same value as the server's)." % m.ENV_AUTH_SECRET, file=sys.stderr)
         return 2
+    if secret[:1] in "\"'" or secret[-1:] in "\"'":
+        # Windows cmd keeps the quotes in `set X="abc"`: the value then differs from the one stored in Modal -> every token is refused
+        print("warning: %s starts or ends with a quote character; it will not match the server's secret unless the server's "
+              "value contains the quotes too." % m.ENV_AUTH_SECRET, file=sys.stderr)
+    fp = m.secret_fingerprint(secret)
+    if a.fingerprint:
+        print(fp)
+        return 0
     if not a.sub:
         print("error: --sub is required", file=sys.stderr)
         return 2
     try:
-        print(m.issue_token(secret, a.sub, int(a.days * 86400)))
+        token = m.issue_token(secret, a.sub, int(a.days * 86400))
     except ValueError as exc:
         print("error:", exc, file=sys.stderr)
         return 2
+    print("signed with secret fingerprint %s  (the Modal log line '[rafiq][boot] ... server_secret_fp=' must show the same)" % fp, file=sys.stderr)
+    print(token)
     return 0
 
 

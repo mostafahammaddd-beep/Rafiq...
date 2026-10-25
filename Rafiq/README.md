@@ -22,6 +22,13 @@ python3 tools/issue_token.py --sub student-017 --days 30   # prints a token: pas
 
 ## Update
 1. `cd backend` → `py -m modal deploy modal_app.py` (after the one-time secret above).
+   *The first deploy after this change rebuilds the image layer once: it downloads the model **and quantises it to INT8 once**
+   (`build_prequantized_artifact`, ~minutes, cached afterwards). Check the build log for `[rafiq][image-build] pre-quantisation: {... "int8": true ...}`;
+   `"int8": false` + a reason means the image holds no INT8 model and the server runs fp32 (slow on 0.125 cores). The very first request after a deploy
+   creates the memory snapshot (slow, once); later cold starts restore it. Every start prints `[rafiq][startup] model ready precision=… fp32_load_s=… int8_load_s=…`
+   and `[rafiq][boot] …`; WebSocket refusals print `[rafiq][ws-reject] reason=…` (see `docs/SECURITY.md` → *Diagnosing a 403*).
+   There is **no warm-up traffic** (no keep-warm, no `/health` polling from the app); the container goes away `scaledown_window` = 20 s after the last socket closes
+   (`RAFIQ_SCALEDOWN_S` to change).*
    *The server is now a class (`Fastapi.asgi_app`) so the memory snapshot can be taken in `@modal.enter(snap=True)`.
    Modal derives the hostname from the names; `Fastapi` + `asgi_app` is meant to keep the v14.4 hostname
    (`…-rafiq-quran-muaalem-backend-fastapi-asgi-app…`) — if the printed URL differs, paste it into the app: ⚙ → رابط الخادم.*
@@ -47,6 +54,7 @@ server → client: `ready` · `progress` (`tracked`, `committed`, `lock_ms`, `au
 
 The phone keeps 250 ms before speech and 500 ms after it, sends nothing after > 500 ms of silence (one `pause` frame instead),
 and a socket silent for 8 s is closed with `paused_idle`; the app reconnects when speech resumes and sends `resume`.
+After a network failure the app retries **at most 3 times** (1 s, 2 s, 4 s), at most 10 times per session; a handshake 401/403/4xx or a close with 1008/1009 is never retried.
 The app reacts to the record button on **touch-down**, so the WebSocket handshake starts ~100–200 ms earlier; it no longer wakes
 the server when merely opened (nothing is billed while browsing).
 
@@ -56,7 +64,7 @@ Rates: $0.0000131/core-s, $0.00000222/GiB-s. Modelled per 65 s session; **the IN
 |---|---|
 | v14.4 live (4 cores, 4 GB, measured RTF 0.352) | ≈ $0.0051 |
 | v14.4 record-then-analyze (the removed default) | ≈ $0.0023 |
-| **v14.5 live, model estimate** (0.125-core reservation, 1.5 GiB, INT8, CPU-bound cadence) | **≈ $0.0015** |
+| **v14.5 live, model estimate** (0.125-core reservation, 1.5 GiB, INT8, CPU-bound cadence; 20 s `scaledown_window` billed after each session ≈ +$0.00006 vs 2 s) | **≈ $0.0015** |
 | reservation + RAM alone (no compute) | ≈ $0.0002 |
 Compute dominates: one INT8 pass over 55 s of speech is already ≈ $0.0006, and the hop setting multiplies it
 (`RAFIQ_HOP_S`: 0.16 s → ×8.0 redundancy, 0.32 s → ×4.7, 0.64 s → ×2.9, 1.0 s → ×2.2, all 50/50 words judged in the simulator).
@@ -75,8 +83,11 @@ ta marbuta → ha, tanween → alif at a stop, a word started fresh after a stop
 * The Kotlin sources were **statically checked** (`backend/dev/static_check_kt.py`), not compiled in this environment.
 * The 216 engine checks and `mutation_test.py` run on a **simulator that fabricates phoneme strings**, not on real recordings: they
   test the judge's logic, not Tajweed accuracy. No precision / false-positive figure for real audio exists yet (`docs/EVALUATION.md`).
-* INT8 quantisation (encoder Linear layers only; heads, projections and adapter stay fp32, guarded by a logit-cosine check),
-  the memory snapshot and the Modal class deployment were written but **not run** here (no torch / Modal / network).
+* INT8 quantisation (encoder Linear layers only; heads, projections and adapter stay fp32) is now done **once at image build** and only deserialised at
+  start-up (guards at build time: logit cosine ≥ 0.985, not slower than fp32 on the build host, reloaded file reproduces the logits). The build step, the artifact
+  round-trip with real torch, the memory snapshot and the Modal class deployment were written and tested against **fakes** but **not run** here (no torch / Modal / network).
+  The 75 s start-up figure came from your logs; the replacement start-up time is **not measured** — read `[rafiq][startup] … total_s=` after deploying.
+* The Android client's reconnect policy (3 retries, 1/2/4 s back-off) and the new handshake-reason handling were **statically** checked only (no Kotlin compiler here).
 
 ## Telling me what is wrong
 Tap a green word → "⚠ فيها خطأ لم يُكتشف"; tap a coloured word → "✔ نطقتها صحيحة"; then ⚙ → "نسخ تقرير فني"

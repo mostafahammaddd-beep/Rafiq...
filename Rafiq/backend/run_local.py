@@ -31,7 +31,7 @@ except Exception:
     m.RUNTIME.load_error = traceback.format_exc()[-1500:]
     print(m.RUNTIME.load_error)
     sys.exit(1)
-print("Ready. Speed test (real-time factor, lower is better):", m.RUNTIME.bench_rtf)
+print("Ready (precision: %s). Speed test (real-time factor, lower is better):" % ("int8" if m.RUNTIME.int8 else "fp32"), m.RUNTIME.measure_rtf())
 print("Now start the tunnel in a second window:  cloudflared tunnel --url http://localhost:8000")
 if _GENERATED_SECRET:
     print("Access token for the app (⚙ -> رمز الدخول), valid 30 days, changes at every restart of this script:")

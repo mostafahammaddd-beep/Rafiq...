@@ -70,7 +70,7 @@ def main():
     ap.add_argument("--session-s", type=float, default=65.0)
     ap.add_argument("--speech-fraction", type=float, default=0.85, help="share of the session that is speech (rest = silence not streamed)")
     ap.add_argument("--startup-s", type=float, default=3.0, help="snapshot restore time that is billed")
-    ap.add_argument("--scaledown-s", type=float, default=2.0)
+    ap.add_argument("--scaledown-s", type=float, default=20.0, help="idle time billed after the last socket closes (modal_app.MODAL_SCALEDOWN_S)")
     ap.add_argument("--fp32-rtf-4thr", type=float, default=0.352, help="MEASURED (README): fp32 real-time factor on 4 threads")
     ap.add_argument("--threads-measured", type=int, default=4)
     ap.add_argument("--int8-speedup", type=float, default=1.8, help="ASSUMPTION: dynamic INT8 speed-up of the encoder")

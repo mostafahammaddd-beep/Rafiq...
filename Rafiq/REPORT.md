@@ -25,7 +25,7 @@ Date: 2026-10-25. Base: `Rafiq-v14.5.zip` (22 files). This report separates **im
 | Input safety | strict verse validation (6236-verse table), frame / rate / session / wall-clock limits, clamped control fields | same |
 | Info leaks | `/health` minimal, `/admin/health`, `/debug/*` off by default and admin-only, generic client errors, docs/CORS off | same |
 | Ops | `tools/issue_token.py`; `run_local.py` self-generates a secret; Modal secret attached from `rafiq-auth` | CLI smoke-run; config check with a fake Modal |
-| Android | token field + `Authorization` header, 401/403 → clear message and no retry loop, cleartext off, backup off, versionCode 19 | **static** Kotlin check only |
+| Android | token field + `Authorization` header, 401/403 → clear message and no retry loop, cleartext off, backup off, versionCode 19; reconnect ≤ 3 retries (1/2/4 s), budget not reset by `ready`, no `/health` warm-up polling | **static** Kotlin check only |
 | Evaluation | `eval/eval_stats.py`, `run_eval.py`, `bench_engine_overhead.py` | `eval/test_eval_stats.py` |
 | Docs | architecture decision, security/privacy, licences, low-end devices, evaluation protocol | — |
 | Judge / engine | **unchanged** | `mutation_test.py` output byte-identical to v14.5 |

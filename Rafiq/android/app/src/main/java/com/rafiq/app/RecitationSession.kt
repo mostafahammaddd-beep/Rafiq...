@@ -7,6 +7,8 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -17,6 +19,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 import kotlin.math.sqrt
 
@@ -88,7 +91,12 @@ class RecitationSession(
     @Volatile private var finished = false
     @Volatile private var captureStarted = false
     @Volatile private var idlePaused = false
+    // إعادة الاتصال: لا حلقة لا نهائية أبداً. attempts = محاولات فاشلة متتالية في «الانقطاع» الحالي؛ تُصفَّر فقط حين يثبت
+    // اتصال سابق STABLE_MS على الأقل (وليس بمجرد وصول «ready»: خادم يردّ ready ثم يسقط كان يعيد الحلقة بلا نهاية).
     @Volatile private var attempts = 0
+    @Volatile private var totalRetries = 0       // سقف مطلق لإعادات الجلسة كلها
+    @Volatile private var readyAtMs = 0L         // SystemClock.elapsedRealtime() لحظة وصول «ready» للمقبس الحالي
+    private val connGen = AtomicInteger(0)       // رقم المقبس الحالي؛ نداءات المقابس الأقدم تُتجاهل
     private var record: AudioRecord? = null
 
     // ------------------------------------------------------------------ بدء / إيقاف
@@ -157,6 +165,7 @@ class RecitationSession(
         finished = true
         capturing = false
         stopRequested = true
+        connGen.incrementAndGet()
         try {
             socket?.cancel()
         } catch (_: Exception) {
@@ -334,15 +343,29 @@ class RecitationSession(
 
     private fun connect() {
         if (finished) return
-        val url = RecitationConfig.webSocketUrl(appContext, strictness)
         val token = RecitationConfig.getAccessToken(appContext)
+        if (token.isEmpty() && RecitationConfig.isMetered(appContext)) {
+            // الخادم يرفض كل جلسة بلا رمز: لا نوقظ حاوية مدفوعة (ولا نستهلك ثواني الإقلاع) لنُرفَض بعد ذلك.
+            Log.w(TAG, "no access token saved: not contacting the metered server")
+            fatal(MSG_NO_TOKEN)
+            return
+        }
+        val url = RecitationConfig.webSocketUrl(appContext, strictness)
         val reqBuilder = Request.Builder().url(url)
         if (token.isNotEmpty()) reqBuilder.header("Authorization", "Bearer $token")
         val req = reqBuilder.build()
+        val gen = connGen.incrementAndGet()
+        readyAtMs = 0L
         val state = if (attempts == 0) 0 else 2
         main.post { if (!finished) listener.onConnection(state) }
+        Log.i(TAG, "connecting: failed attempts in this outage=$attempts, retries this session=$totalRetries, " +
+            "server=${RecitationConfig.getServerBaseUrl(appContext)}")
         socket = Net.client.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (gen != connGen.get()) {
+                    webSocket.cancel()
+                    return
+                }
                 synchronized(lock) {
                     open = true
                     stopSent = false
@@ -363,37 +386,91 @@ class RecitationSession(
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                if (gen != connGen.get()) return
                 handleMessage(text)
             }
 
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                // الخادم أعلن الإغلاق: نردّ فوراً ليصل onClosed الآن، لا بعد انتهاء مهلة النبض (ping).
+                try {
+                    webSocket.close(1000, null)
+                } catch (_: Exception) {
+                }
+            }
+
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                onSocketGone(webSocket)
+                if (gen != connGen.get()) return
+                Log.i(TAG, "closed by server: code=$code reason=$reason")
+                open = false
+                if (!finished && !idlePaused && (code == 1008 || code == 1009)) {
+                    // انتهاك سياسة / رسالة أكبر من المسموح: الطلب نفسه سيُرفض ثانيةً، فإعادة المحاولة بلا فائدة
+                    fatal(MSG_REFUSED)
+                    return
+                }
+                onSocketGone(gen)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                // 401 / 403 عند المصافحة: الرمز مفقود أو غير صالح أو منتهٍ. إعادة المحاولة لن تفيد.
-                val code = response?.code
-                if (webSocket === socket && (code == 401 || code == 403)) {
-                    open = false
-                    fatal("رمز الدخول غير صالح أو منتهي. أدخل رمزًا جديدًا من ⚙ الإعدادات.")
+                if (gen != connGen.get()) return
+                open = false
+                val http = response?.code ?: 0
+                val why = denialReason(response)
+                Log.w(TAG, "connection failed: http=$http reason=${if (why.isEmpty()) "-" else why} " +
+                    "error=${t.javaClass.simpleName}: ${t.message}")
+                if (http == 401 || http == 403) {
+                    // مرفوض عند المصافحة: الرمز مفقود أو غير صالح أو منتهٍ (أو الخادم غير مهيّأ). إعادة المحاولة لن تفيد.
+                    fatal(authMessage(why))
                     return
                 }
-                onSocketGone(webSocket)
+                if (http in 400..499 && http != 408 && http != 429) {
+                    // خطأ في الطلب نفسه (رابط خاطئ مثلاً): نفس النتيجة في كل مرة
+                    fatal("تعذّر الاتصال: رفض الخادم الطلب (HTTP $http). تأكد من رابط الخادم في ⚙ الإعدادات.")
+                    return
+                }
+                onSocketGone(gen)
             }
         })
     }
 
-    private fun onSocketGone(ws: WebSocket) {
-        if (ws !== socket) return
+    /** رمز السبب (token_missing | token_expired | token_invalid | server_auth_unconfigured) من جسم ردّ 403، أو "" إن لم يوجد. */
+    private fun denialReason(response: Response?): String {
+        if (response == null) return ""
+        return try {
+            JSONObject(response.peekBody(512).string()).optString("reason", "")
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    private fun authMessage(reason: String): String = when (reason) {
+        "token_missing" -> MSG_NO_TOKEN
+        "token_expired" -> "انتهت صلاحية رمز الدخول. اطلب رمزًا جديدًا وأدخله من ⚙ الإعدادات."
+        "token_invalid" -> "رمز الدخول غير صالح. الصقه كاملًا بلا مسافات أو علامات اقتباس، وتأكد أنه صادر بنفس السرّ المحفوظ في الخادم."
+        "server_auth_unconfigured" -> "الخادم غير مهيّأ للتحقق من رموز الدخول (السرّ rafiq-auth غير متاح له). على صاحب الخادم مراجعة سجلات Modal."
+        else -> "رمز الدخول غير صالح أو منتهٍ. أدخل رمزًا جديدًا من ⚙ الإعدادات."
+    }
+
+    /**
+     * انقطع المقبس. إعادة الاتصال: حتى MAX_RETRIES مرات في الانقطاع الواحد، بتراجع أُسّي 1 ث ← 2 ث ← 4 ث، ثم نتوقف ونُبلغ
+     * المستخدم. الميزانية لا تُصفَّر إلا إذا كان الاتصال الذي سقط قد بقي سليماً STABLE_MS على الأقل، وهناك سقف مطلق للجلسة.
+     */
+    private fun onSocketGone(gen: Int) {
+        if (gen != connGen.get()) return
         open = false
         if (finished || idlePaused) return          // الخمول: لا نعيد الاتصال حتى يعود الكلام
+        val rdy = readyAtMs
+        if (rdy > 0L && SystemClock.elapsedRealtime() - rdy >= STABLE_MS) attempts = 0
         attempts++
-        if (attempts > 8) {
-            fatal("تعذّر الاتصال بالخادم. تأكد من الإنترنت ثم أعد المحاولة.")
+        if (attempts > MAX_RETRIES || totalRetries >= MAX_RETRIES_PER_SESSION) {
+            Log.w(TAG, "giving up: attempts=$attempts totalRetries=$totalRetries")
+            fatal(MSG_RETRIES_EXHAUSTED)
             return
         }
+        totalRetries++
+        val delayMs = RETRY_BASE_MS shl (attempts - 1)          // 1000, 2000, 4000
+        Log.i(TAG, "retry $attempts/$MAX_RETRIES in $delayMs ms")
         main.post { if (!finished) listener.onConnection(2) }
-        main.postDelayed({ if (!finished) connect() }, minOf(5000L, 700L * attempts))
+        main.postDelayed({ if (!finished) connect() }, delayMs)
     }
 
     /** يرسل إطار resume (إن لزم) ثم كل عناصر صندوق الإرسال بالترتيب، ثم رسالة الإيقاف إن طُلبت. */
@@ -433,7 +510,7 @@ class RecitationSession(
         }
         when (o.optString("type")) {
             "ready" -> {
-                attempts = 0
+                readyAtMs = SystemClock.elapsedRealtime()      // لا نُصفّر attempts هنا (انظر الشرح عند تعريفها)
                 beginCapture()
                 val arr = o.optJSONArray("words")
                 val ws = ArrayList<String>()
@@ -511,6 +588,14 @@ class RecitationSession(
     }
 
     companion object {
+        private const val TAG = "RafiqWS"
+        private const val MAX_RETRIES = 3                 // إعادات الاتصال في الانقطاع الواحد
+        private const val MAX_RETRIES_PER_SESSION = 10    // سقف مطلق مهما تكرر الانقطاع
+        private const val RETRY_BASE_MS = 1_000L          // التراجع: 1 ث، 2 ث، 4 ث (يتّسع داخل scaledown_window = 20 ث في الخادم)
+        private const val STABLE_MS = 15_000L             // اتصال عاش هذه المدة يُعدّ سليماً فتبدأ ميزانية إعادة جديدة
+        private const val MSG_NO_TOKEN = "لا يوجد رمز دخول. افتح ⚙ الإعدادات والصق الرمز في حقل «رمز الدخول»."
+        private const val MSG_REFUSED = "رفض الخادم هذه الجلسة. أعد المحاولة بعد قليل."
+        private const val MSG_RETRIES_EXHAUSTED = "تعذّر الاتصال بالخادم بعد ٣ محاولات إعادة. تأكد من الإنترنت ثم أعد المحاولة."
         private const val MAX_SESSION_MS = 300_000L   // 5 دقائق كحد أقصى
         private const val SUB_MS = 20                  // دقة قرار الصمت/الكلام
         private const val HOP_SUB = 8                  // 8 × 20ms = 160ms لكل إرسال

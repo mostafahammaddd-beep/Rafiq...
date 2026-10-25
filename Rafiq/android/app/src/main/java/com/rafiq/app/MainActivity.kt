@@ -176,7 +176,7 @@ fun TopBar(c: RafiqController, onSettings: () -> Unit) {
             fontSize = 12.sp,
             modifier = Modifier
                 .clip(RoundedCornerShape(50))
-                .clickable(enabled = c.serverState == 2 || c.serverState == 3) { c.retryServer() }
+                .clickable(enabled = c.serverState == 2) { c.resetServerState() }
                 .padding(horizontal = 8.dp, vertical = 4.dp)
         )
         Spacer(Modifier.width(4.dp))

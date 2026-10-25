@@ -1,7 +1,7 @@
 # Security and privacy — v14.6
 
 Scope: `backend/modal_app.py` (WebSocket + HTTP routes), the Android app's networking/storage, repository hygiene.
-"Tested" means covered by `backend/dev/test_security.py` (97 checks) against the real handler through a **stub of FastAPI**.
+"Tested" means covered by `backend/dev/test_security.py` (118 checks) against the real handler through a **stub of FastAPI**.
 Real Starlette/uvicorn/Modal behaviour was **not** exercised (not installed / no network) — see "Not verified".
 
 ## Findings in v14.5 and what changed
@@ -32,7 +32,29 @@ py -m modal deploy modal_app.py
 export RAFIQ_AUTH_SECRET=<secret1>
 python3 tools/issue_token.py --sub student-017 --days 30       # give the token to that learner/teacher
 ```
-In the app: ⚙ → رمز الدخول → paste → حفظ. A 401/403 at the handshake shows "invalid or expired token" and stops retrying.
+In the app: ⚙ → رمز الدخول → paste → حفظ. A 401/403 at the handshake stops retrying at once and shows why (see below). With no saved
+token the app does not contact a `modal.run` server at all (it would only start a container to be refused).
+
+### Diagnosing a 403 on `/ws/live-recitation`
+A WebSocket refused **before** `accept()` is answered by uvicorn with a bare HTTP 403. Every such refusal is now one line in the Modal log
+(`modal app logs rafiq-quran-muaalem-backend`), with the exact cause and what the client really sent — never the token or the secret:
+
+```
+[rafiq][ws-reject] reason=signature auth_mode=token server_secret_fp=415a65ff detail=- has_authorization=1 scheme=Bearer token_len=147 token_hint=shape_ok headers=[authorization,host,user-agent,...] client=… ua=okhttp/4.12.0
+[rafiq][boot] where=serve version=14.6 auth_mode=token server_secret_fp=415a65ff secret_env=set admin_token=set …
+```
+| `reason=` | meaning | fix |
+|---|---|---|
+| `auth_not_configured` (`auth_mode=closed`, `server_secret_fp=none`, `secret_env=MISSING`) | the container has no usable `RAFIQ_AUTH_SECRET` (secret not attached, or < 32 chars) | `modal secret create rafiq-auth …`, redeploy |
+| `missing_token`, `has_authorization=0` | no `Authorization` header arrived. If `headers=[…]` lacks `authorization` the proxy/client dropped it | enter the token in the app; check the header list |
+| `signature` | token was signed with a different secret (or the secret has quotes/spaces) | `python tools/issue_token.py --fingerprint` must print the same value as `server_secret_fp`; re-issue the token |
+| `expired` | past `exp` (+60 s); `detail` says how long ago | issue a new token |
+| `malformed` | not an `rq1.` token, or `detail` says the issuing PC's clock is ahead of the server | look at `token_hint=` (`wrapped_in_quotes`, `double_bearer_prefix`, `contains_whitespace`, `not_an_rq1_token`) |
+
+`where=snapshot` and `where=serve` boot lines must show the same `server_secret_fp` (a memory-snapshot restore must not keep a stale environment).
+The 403 body carries a coarse `{"reason": token_missing | token_invalid | token_expired | server_auth_unconfigured}` that the app turns into a message,
+on servers that support the ASGI WebSocket Denial Response extension (Starlette ≥ 0.37 with a recent uvicorn); otherwise the app only sees "403" and the log is the source of truth.
+Logging is limited to 30 refusals per minute per container; header values are sanitised (no log forging).
 Revocation: rotate `RAFIQ_AUTH_SECRET` (invalidates **all** tokens). There is **no per-token revocation list** and no
 login/account system; tokens are bearer credentials stored unencrypted in the app's private preferences. Use short
 lifetimes for children's devices.
@@ -48,7 +70,7 @@ lifetimes for children's devices.
 
 ## Not verified / not done (human work needed)
 
-* Real Starlette behaviour (close-before-accept → HTTP 403, `Request` injection) and real Modal deployment: **BLOCKED**.
+* Real Starlette behaviour (close-before-accept → HTTP 403, the denial-response body, `Request` injection) and real Modal deployment: **BLOCKED** (the stub tests cover the logic and the fallback, not the wire).
 * **Consent flow for recording, especially children's voices, a privacy notice, parental-consent mechanism, retention
   statement and data-subject procedures: not implemented.** What the law requires depends on where learners are; get legal
   advice before releasing to minors. The app should show the consent screen before the first microphone use.

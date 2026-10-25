@@ -80,9 +80,20 @@ except ImportError:  # pragma: no cover
 # ==============================================================================
 USE_MEMORY_SNAPSHOT = True   # Modal restores a snapshot of the loaded model: near-instant cold start
 USE_GPU = False          # set True ONLY after you add a card to Modal (T4 GPU = ~10x faster)
-PRECISION = "auto"       # "auto": int8 only if fp32 is far too slow (rtf > AUTO_INT8_ABOVE_RTF) | "fp32" | "int8"
-AUTO_INT8_ABOVE_RTF = 0.60
+# INT8 is decided and produced ONCE, while the image is built (build_prequantized_artifact). Start-up only LOADS
+# the finished file - it never quantises, never benchmarks fp32 vs int8 (that cost ~75 s on every cold start).
+#   "auto" / "int8": pre-quantise at image build (kept only if the logits stay close and it is not slower)
+#   "fp32":          skip quantisation (image holds no artifact, the server runs fp32)
+PRECISION = "auto"
 MODEL_ID = "obadx/muaalem-model-v3_2"
+# Where the image build writes the quantised encoder, and where start-up reads it from.
+QUANT_DIR = os.environ.get("RAFIQ_QUANT_DIR", "/opt/rafiq-quant")
+QUANT_MODEL_FILE = "encoder_int8.pt"
+QUANT_META_FILE = "meta.json"
+QUANT_FORMAT = 1                  # bump when the artifact layout changes (stale artifacts are then ignored, not trusted)
+QUANT_MIN_COSINE = 0.985          # fp32 vs int8 logits (every head) must stay at least this similar, else fp32 is kept
+QUANT_RELOAD_COSINE = 0.9999      # the file written to disk must reproduce the in-memory int8 model's logits
+QUANT_MAX_SLOWDOWN = 1.10         # int8 slower than fp32 by more than 10 % on the build host -> not worth shipping
 APP_NAME = "rafiq-quran-muaalem-backend"
 DEFAULT_SURA, DEFAULT_AYA = 2, 255
 
@@ -2729,6 +2740,7 @@ class ModelRuntime:
         self.bench_rtf: Optional[float] = None
         self.bench_rtf_int8: Optional[float] = None
         self.load_seconds: Optional[float] = None
+        self.timings: Dict[str, float] = {}                 # seconds per start-up stage (logged once, shown in /admin/health)
         self.load_error: Optional[str] = None
         self.diag: Dict[str, Any] = {}
         self.id2char: Dict[int, str] = {}
@@ -2740,14 +2752,19 @@ class ModelRuntime:
 
     # ---------------------------------------------------------------- loading
     def ensure_loaded(self) -> None:
+        """Loads the model. Start-up does NO quantisation and NO fp32-vs-int8 benchmarking: the INT8 encoder was built once
+        while the image was built and is only deserialised here (`_use_prequantized`). In Modal this whole method runs
+        inside the memory-snapshot hook, so restored containers skip it entirely."""
         if self.muaalem is not None:
             return
         with self._load_lock:
             if self.muaalem is not None:
                 return
             t0 = time.time()
+            tm: Dict[str, float] = {}
             import torch
             from quran_muaalem import Muaalem
+            tm["import_s"] = round(time.time() - t0, 1)
 
             torch.set_num_threads(NUM_THREADS)
             try:
@@ -2757,17 +2774,30 @@ class ModelRuntime:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
             dtype = torch.bfloat16 if self.device == "cuda" else torch.float32
             self.lib = QuranLib()
+            t = time.time()
             m = Muaalem(model_name_or_path=MODEL_ID, device=self.device, dtype=dtype)
+            tm["fp32_load_s"] = round(time.time() - t, 1)
+            t = time.time()
             try:
-                ref: Optional[RefAya] = self.get_ref(DEFAULT_SURA, DEFAULT_AYA)   # also pre-computes waqf forms
+                self.get_ref(DEFAULT_SURA, DEFAULT_AYA)             # also pre-computes waqf forms
             except Exception:
-                ref = None                                          # retried at the first session
-            if self.device == "cpu" and ref is not None:
-                self._tune_precision(m, ref)
+                pass                                                # retried at the first session
+            tm["ref_s"] = round(time.time() - t, 1)
+            if self.device == "cpu":                                # dynamic INT8 is a CPU-only technique
+                t = time.time()
+                self._use_prequantized(m)
+                tm["int8_load_s"] = round(time.time() - t, 1)
             self._install_capture(m)
+            t = time.time()
             self.diag["internals"] = self._probe_internals(m)
+            tm["probe_s"] = round(time.time() - t, 1)
             self.muaalem = m
             self.load_seconds = round(time.time() - t0, 1)
+            tm["total_s"] = self.load_seconds
+            self.timings = tm
+            print("[rafiq][startup] model ready precision=%s source=%s device=%s %s" % (
+                "int8" if self.int8 else "fp32", self.quant_info.get("source", "?"), self.device,
+                " ".join("%s=%s" % kv for kv in tm.items())), flush=True)
 
     def warmup(self) -> None:
         """Dummy inference so every lazy initialisation (feature extractor, kernels, the logit hook) is part of the
@@ -2896,37 +2926,67 @@ class ModelRuntime:
                     worst = min(worst, cos)
         return worst
 
-    def _tune_precision(self, m: Any, ref: RefAya) -> None:
-        """Keeps fp32 when the CPU is fast enough; otherwise tries hybrid INT8 (and keeps it only if it really is
-        faster, still runs, and its logits stay close to fp32). Any failure leaves the original fp32 model."""
-        rtf = self._time_inference(m, ref)
-        self.bench_rtf = None if rtf is None else round(rtf, 3)
-        want_int8 = PRECISION == "int8" or (PRECISION == "auto" and rtf is not None and rtf > AUTO_INT8_ABOVE_RTF)
-        if not want_int8 or getattr(m, "model", None) is None:
+    def _use_prequantized(self, m: Any) -> None:
+        """Swaps in the INT8 encoder that `build_prequantized_artifact` wrote while the image was built.
+
+        This method only DESERIALISES. It never calls quantize_dynamic and never benchmarks: if the artifact is missing,
+        stale (other torch / model / format) or unreadable, the model simply stays fp32 and the reason is recorded in
+        `quant_info` (visible in the start-up log line and in /admin/health)."""
+        info = self.quant_info
+        if PRECISION == "fp32":
+            info.update(source="none", reason="PRECISION=fp32")
             return
-        old = m.model
+        meta_path = os.path.join(QUANT_DIR, QUANT_META_FILE)
+        model_path = os.path.join(QUANT_DIR, QUANT_MODEL_FILE)
         try:
-            q = self._quantize_encoder_only(old)
-            close = self._quant_close(m, old, q)
-            self.quant_info["min_logit_cosine"] = None if close is None else round(close, 4)
-            if close is not None and close < 0.985:
-                self.quant_info["rejected"] = "logits drifted"
-                del q
+            if not os.path.exists(meta_path):
+                info.update(source="none", reason="no pre-quantised artifact in this image (run the image build step)")
+                print("[rafiq][startup] WARNING: no INT8 artifact at %s - running fp32 (slow on a small CPU)" % QUANT_DIR, flush=True)
                 return
-            m.model = q
-            rq = self._time_inference(m, ref)
-            if rq is not None and (rtf is None or rq < rtf * 0.9):
-                self.int8 = True
-                self.bench_rtf_int8 = round(rq, 3)
-                del old
-            else:
-                m.model = old
-                del q
-        except Exception as exc:
-            m.model = old
-            self.quant_info["error"] = repr(exc)[:160]
+            with open(meta_path, encoding="utf-8") as fh:
+                meta = json.load(fh)
+            import torch
+            problems: List[str] = []
+            if meta.get("format") != QUANT_FORMAT:
+                problems.append("artifact format %r != %r" % (meta.get("format"), QUANT_FORMAT))
+            if meta.get("int8") is not True:
+                problems.append("build kept fp32: %s" % meta.get("reason", "unknown"))
+            if meta.get("model_id") != MODEL_ID:
+                problems.append("built for model %r" % meta.get("model_id"))
+            if meta.get("torch") != torch.__version__:
+                problems.append("built with torch %s, running %s" % (meta.get("torch"), torch.__version__))
+            size = os.path.getsize(model_path) if os.path.exists(model_path) else -1
+            if meta.get("int8") is True and size != meta.get("bytes"):
+                problems.append("artifact size %d != %r (truncated?)" % (size, meta.get("bytes")))
+            if problems:
+                info.update(source="none", reason="; ".join(problems))
+                print("[rafiq][startup] INT8 artifact not used (%s) - running fp32" % info["reason"], flush=True)
+                return
+            t = time.time()
+            q = torch.load(model_path, map_location="cpu", weights_only=False)   # our own file, written at image build
+            q.eval()
+            m.model = q                      # the fp32 encoder loses its last reference here and is freed below
+            self.int8 = True
+            info.update(source="image-artifact", scope=meta.get("scope"), layers=meta.get("layers"),
+                        min_logit_cosine=meta.get("min_logit_cosine"), cosine_checked=meta.get("cosine_checked"),
+                        file_mb=round(size / 2 ** 20, 1), load_s=round(time.time() - t, 1), build_bench=meta.get("bench"))
+        except Exception as exc:             # a bad artifact must never take the server down: fall back to fp32
+            info.update(source="none", error=repr(exc)[:200])
+            print("[rafiq][startup] INT8 artifact failed to load (%s) - running fp32" % repr(exc)[:200], flush=True)
         finally:
             gc.collect()
+
+    def measure_rtf(self) -> Optional[float]:
+        """Real-time factor of one forward pass (lower is better). A MANUAL tool (run_local.py, the image build): start-up
+        never calls it."""
+        self.ensure_loaded()
+        rtf = self._time_inference(self.muaalem, self.get_ref(DEFAULT_SURA, DEFAULT_AYA))
+        if rtf is not None:
+            if self.int8:
+                self.bench_rtf_int8 = round(rtf, 3)
+            else:
+                self.bench_rtf = round(rtf, 3)
+        return rtf
 
     # ---------------------------------------------------------------- references
     def get_ref(self, sura: int, aya: int) -> RefAya:
@@ -2993,7 +3053,7 @@ class ModelRuntime:
             "engine": ENGINE_NAME, "model": MODEL_ID, "device": self.device, "int8": self.int8,
             "quant": self.quant_info,
             "bench_rtf_fp32": self.bench_rtf, "bench_rtf_int8": self.bench_rtf_int8,
-            "load_seconds": self.load_seconds, "load_error": self.load_error, "diag": self.diag,
+            "load_seconds": self.load_seconds, "startup_timings": self.timings, "load_error": self.load_error, "diag": self.diag,
             "refs": [{"sura": k[0], "aya": k[1], "words": v.n, "approx": v.approx,
                       "segmentation": v.info.get("segmentation"), "waqf_forms": v.info.get("waqf_forms"),
                       "sifat": v.group_of_char is not None} for k, v in self._refs.items()],
@@ -3001,6 +3061,88 @@ class ModelRuntime:
 
 
 RUNTIME = ModelRuntime()
+
+
+def build_prequantized_artifact(m: Any, out_dir: str = QUANT_DIR) -> Dict[str, Any]:
+    """IMAGE-BUILD step (runs once inside `download_muaalem_weights`, never at start-up): quantise the encoder Linear
+    layers of the already-loaded fp32 Muaalem `m`, check the result and write
+
+        <out_dir>/encoder_int8.pt   the whole quantised torch module (pickle, trusted: we wrote it a moment ago)
+        <out_dir>/meta.json         what it is and how it was verified (start-up refuses anything that does not match)
+
+    The INT8 model is only kept when (1) fp32-vs-int8 logits of every head stay >= QUANT_MIN_COSINE, (2) it is not slower
+    than fp32 on this build host (> QUANT_MAX_SLOWDOWN), and (3) the file written to disk, loaded back, reproduces the
+    in-memory logits (>= QUANT_RELOAD_COSINE). Otherwise meta.json says int8=false + why, and the server runs fp32.
+    Never raises (an image build must not fail because of an optimisation); everything is printed to the build log."""
+    import torch
+    model_path = os.path.join(out_dir, QUANT_MODEL_FILE)
+    meta_path = os.path.join(out_dir, QUANT_META_FILE)
+    meta: Dict[str, Any] = {"format": QUANT_FORMAT, "model_id": MODEL_ID, "torch": torch.__version__, "int8": False}
+    t0 = time.time()
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        for stale in (model_path, model_path + ".tmp", meta_path):      # a rebuilt layer never keeps an old artifact
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+        if PRECISION == "fp32":
+            meta["reason"] = "PRECISION=fp32"
+            return meta
+        rt = ModelRuntime()
+        rt.lib = QuranLib()
+        ref = rt.get_ref(DEFAULT_SURA, DEFAULT_AYA)
+        fp32_model = m.model
+        fp32_rtf = rt._time_inference(m, ref)
+        q = rt._quantize_encoder_only(fp32_model)
+        meta.update(scope=rt.quant_info.get("scope"), layers=rt.quant_info.get("layers"))
+        cos = rt._quant_close(m, fp32_model, q)
+        meta["cosine_checked"] = cos is not None
+        meta["min_logit_cosine"] = None if cos is None else round(cos, 4)
+        if cos is not None and cos < QUANT_MIN_COSINE:
+            meta["reason"] = "logits drifted (cosine %.4f < %.3f)" % (cos, QUANT_MIN_COSINE)
+            return meta
+        m.model = q
+        try:
+            int8_rtf = rt._time_inference(m, ref)
+        finally:
+            m.model = fp32_model
+        meta["bench"] = {"host": "image-build", "fp32_rtf": None if fp32_rtf is None else round(fp32_rtf, 3),
+                         "int8_rtf": None if int8_rtf is None else round(int8_rtf, 3)}
+        if fp32_rtf is not None and int8_rtf is not None and int8_rtf > fp32_rtf * QUANT_MAX_SLOWDOWN:
+            meta["reason"] = "int8 slower than fp32 on the build host (%.3f vs %.3f)" % (int8_rtf, fp32_rtf)
+            return meta
+        torch.save(q, model_path + ".tmp")
+        os.replace(model_path + ".tmp", model_path)
+        q_back = torch.load(model_path, map_location="cpu", weights_only=False)
+        q_back.eval()
+        back = rt._quant_close(m, q, q_back)
+        if back is not None and back < QUANT_RELOAD_COSINE:
+            meta["reason"] = "saved file does not reproduce the in-memory model (cosine %.6f)" % back
+            os.remove(model_path)
+            return meta
+        meta.update(int8=True, bytes=os.path.getsize(model_path), reload_cosine=None if back is None else round(back, 6))
+        return meta
+    except Exception as exc:
+        meta["int8"] = False
+        meta["reason"] = "build error: %s" % repr(exc)[:300]
+        try:
+            os.remove(model_path)
+        except OSError:
+            pass
+        return meta
+    finally:
+        meta["build_seconds"] = round(time.time() - t0, 1)
+        try:
+            with open(meta_path, "w", encoding="utf-8") as fh:
+                json.dump(meta, fh, indent=1, sort_keys=True)
+        except OSError as exc:                                          # no meta.json = start-up runs fp32; never fail the build
+            meta["int8"] = False
+            print("[rafiq][image-build] could not write %s: %r" % (meta_path, exc), flush=True)
+        print("[rafiq][image-build] pre-quantisation: %s" % json.dumps(meta, sort_keys=True), flush=True)
+        if not meta.get("int8"):
+            print("[rafiq][image-build] WARNING: no INT8 model was produced - the server will run fp32 (slow on a 0.125-core "
+                  "reservation). Reason above.", flush=True)
 
 
 def debug_snapshot(eng: "SessionEngine", runtime: ModelRuntime, steps: int = 60) -> Dict[str, Any]:
@@ -3056,9 +3198,10 @@ AYA_COUNTS: Tuple[int, ...] = (
 
 
 class AuthError(Exception):
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, detail: str = "") -> None:
         super().__init__(reason)
         self.reason = reason
+        self.detail = detail              # server-log only (numbers such as "expired 3 days ago"), never sent to a client
 
 
 def _b64e(raw: bytes) -> str:
@@ -3106,11 +3249,12 @@ def verify_token(secret: str, token: str, now: Optional[float] = None, scope: st
         raise AuthError("malformed") from None
     t = time.time() if now is None else now
     if exp + CLOCK_SKEW_S < t:
-        raise AuthError("expired")
+        raise AuthError("expired", "sub=%s expired %d s ago (exp=%d, server_now=%d)" % (sub, int(t - exp), exp, int(t)))
     if iat - CLOCK_SKEW_S > t or exp <= iat:
-        raise AuthError("malformed")
+        raise AuthError("malformed", "sub=%s issued %d s in the future (iat=%d, server_now=%d): clock of the machine that "
+                                     "issued the token is ahead of the server" % (sub, int(iat - t), iat, int(t)))
     if sc != scope:
-        raise AuthError("scope")
+        raise AuthError("scope", "sub=%s token scope %r, endpoint needs %r" % (sub, sc, scope))
     return {"sub": sub, "exp": exp, "iat": iat, "scope": sc}
 
 
@@ -3161,19 +3305,30 @@ def bearer_token(headers: Any) -> Optional[str]:
     return tok.strip() if kind.lower() == "bearer" and tok.strip() else None
 
 
-def authenticate(headers: Any) -> Tuple[Optional[str], str]:
-    """(subject, reason). subject None = refuse. The token is read from the Authorization header ONLY (a query-string
-    token would end up in proxy / access logs)."""
+def authenticate_ex(headers: Any) -> Tuple[Optional[str], str, str]:
+    """(subject, reason, detail). subject None = refuse. The token is read from the Authorization header ONLY (a
+    query-string token would end up in proxy / access logs). `detail` is for the server log, never for the client."""
     secret = AccessPolicy.secret()
     if secret is None:
-        return ("anonymous", "anonymous") if AccessPolicy.allow_anonymous() else (None, "auth_not_configured")
+        if AccessPolicy.allow_anonymous():
+            return "anonymous", "anonymous", ""
+        configured = bool(_env(ENV_AUTH_SECRET))
+        return None, "auth_not_configured", (
+            "%s is %s in this container's environment" % (ENV_AUTH_SECRET, "set but shorter than %d characters" % MIN_SECRET_CHARS
+                                                           if configured else "NOT set (is the Modal secret attached?)"))
     tok = bearer_token(headers)
     if tok is None:
-        return None, "missing_token"
+        return None, "missing_token", ""
     try:
-        return verify_token(secret, tok)["sub"], "ok"
+        return verify_token(secret, tok)["sub"], "ok", ""
     except AuthError as exc:
-        return None, exc.reason
+        return None, exc.reason, exc.detail
+
+
+def authenticate(headers: Any) -> Tuple[Optional[str], str]:
+    """(subject, reason). subject None = refuse."""
+    subject, reason, _detail = authenticate_ex(headers)
+    return subject, reason
 
 
 def is_admin(headers: Any) -> bool:
@@ -3268,6 +3423,98 @@ def public_error(code: str, exc: Optional[BaseException] = None) -> Dict[str, An
     return {"type": "error", "code": code, "message": msgs.get(code, msgs["internal"]), "ref": ref}
 
 
+# ---- handshake diagnostics -----------------------------------------------------------------------------------------
+# A WebSocket that is closed BEFORE accept() is answered by uvicorn with a bare HTTP 403 - the client cannot tell why. These
+# helpers write one greppable line per refusal to the server log (Modal: `modal app logs` / dashboard) and give the client
+# a coarse, non-sensitive reason code in the body of the 403. Neither the token nor the secret is ever printed.
+REJECT_PUBLIC = {            # server-side reason -> what the (unauthenticated) client may be told
+    "missing_token": "token_missing",
+    "malformed": "token_invalid", "signature": "token_invalid", "scope": "token_invalid",
+    "expired": "token_expired",
+    "auth_not_configured": "server_auth_unconfigured",
+}
+_REJECT_LOG = RateWindow(30, 60.0)          # a scanner must not be able to flood the log
+_REJECT_SUPPRESSED = [0]
+
+
+def secret_fingerprint(secret: Optional[str]) -> str:
+    """8 hex chars of SHA-256(secret): lets the owner compare the secret in Modal with the one that signed a token
+    (tools/issue_token.py --fingerprint) without printing the secret."""
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()[:8] if secret else "none"
+
+
+def token_hint(tok: Optional[str]) -> str:
+    """Why a token that arrived looks wrong, from its SHAPE only (the usual copy/paste accidents)."""
+    if not tok:
+        return "empty"
+    if tok[:1] in "\"'" or tok[-1:] in "\"'":
+        return "wrapped_in_quotes"
+    if tok.lower().startswith("bearer"):
+        return "double_bearer_prefix"
+    if any(c.isspace() for c in tok):
+        return "contains_whitespace"
+    if not tok.startswith(TOKEN_PREFIX + ".") or tok.count(".") != 2:
+        return "not_an_rq1_token"
+    return "shape_ok"
+
+
+_LOG_OK = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:/;()+,=@[]-")
+
+
+def _logsafe(value: Any, limit: int = 80) -> str:
+    """Header values are attacker-controlled: keep a log line ONE line (no CR/LF, no spaces, no control characters)."""
+    text = "" if value is None else str(value)
+    return "".join(c if c in _LOG_OK else "_" for c in text[:limit]) or "-"
+
+
+def describe_handshake(websocket: Any) -> str:
+    """key=value summary of what the client actually sent. Header NAMES only (plus a few harmless values): the point is to
+    see whether `authorization` survived the proxy at all. The token itself is never printed."""
+    headers = getattr(websocket, "headers", None) or {}
+    try:
+        names = sorted({str(k).lower() for k in headers.keys()})
+    except Exception:
+        names = []
+
+    def hget(name: str) -> str:
+        try:
+            v = headers.get(name) or headers.get(name.title())         # Starlette's Headers is case-insensitive, a dict is not
+        except Exception:
+            v = None
+        return str(v).strip() if v else ""
+
+    raw = hget("authorization")
+    scheme, _, tok = raw.partition(" ")
+    tok = tok.strip()
+    client = getattr(websocket, "client", None)
+    return ("has_authorization=%d scheme=%s token_len=%d token_hint=%s headers=[%s] client=%s xff=%s ua=%s origin=%s" % (
+        1 if raw else 0, _logsafe(scheme, 12), len(tok), token_hint(tok) if raw else "-", ",".join(_logsafe(n, 40) for n in names),
+        _logsafe(getattr(client, "host", None)), _logsafe(hget("x-forwarded-for")), _logsafe(hget("user-agent")),
+        _logsafe(hget("origin"))))
+
+
+def log_ws_reject(websocket: Any, reason: str, detail: str = "") -> None:
+    if not _REJECT_LOG.allow():
+        _REJECT_SUPPRESSED[0] += 1
+        return
+    extra = " (+%d more refusals not logged)" % _REJECT_SUPPRESSED[0] if _REJECT_SUPPRESSED[0] else ""
+    _REJECT_SUPPRESSED[0] = 0
+    print("[rafiq][ws-reject] reason=%s auth_mode=%s server_secret_fp=%s detail=%s %s%s" % (
+        reason, AccessPolicy.mode(), secret_fingerprint(AccessPolicy.secret()), _logsafe(detail, 200),
+        describe_handshake(websocket), extra), flush=True)
+
+
+def log_boot_banner(where: str) -> None:
+    """One line per process start: is the auth secret visible to THIS container, and which fingerprint does it have?
+    (In a memory-snapshot restore, `where=snapshot` and `where=serve` must print the same fingerprint.)"""
+    print("[rafiq][boot] where=%s version=%s auth_mode=%s server_secret_fp=%s secret_env=%s admin_token=%s debug_endpoints=%s "
+          "cors_origins=%d scaledown_s=%s" % (
+              where, VERSION, AccessPolicy.mode(), secret_fingerprint(AccessPolicy.secret()),
+              "set" if _env(ENV_AUTH_SECRET) else "MISSING", "set" if AccessPolicy.admin_token() else "unset",
+              "on" if AccessPolicy.debug_enabled() else "off", len(AccessPolicy.cors_origins()),
+              MODAL_SCALEDOWN_S), flush=True)
+
+
 # ==============================================================================
 # FastAPI application (live websocket only)
 # ==============================================================================
@@ -3350,23 +3597,42 @@ def build_fastapi_app(runtime: ModelRuntime = RUNTIME):
         ref = await asyncio.to_thread(runtime.get_ref, params["sura"], params["aya"])
         return JSONResponse(ref.describe())
 
+    async def deny_handshake(websocket: Any, reason: str, detail: str) -> None:
+        """Refuse BEFORE accept(): nothing is accepted, no model is touched, nothing is billed. uvicorn answers this with
+        HTTP 403. The refusal is logged with its exact cause; the client gets a coarse reason code in the 403 body
+        (ASGI "WebSocket Denial Response" extension) so the app can say WHY. Servers / Starlette versions without that
+        extension fall back to the plain close (a bare 403), which is what v14.6 always did."""
+        log_ws_reject(websocket, reason, detail)
+        try:
+            await websocket.send_denial_response(JSONResponse(
+                {"error": "unauthorized", "reason": REJECT_PUBLIC.get(reason, "token_invalid")}, status_code=403))
+            return
+        except Exception:
+            pass
+        try:
+            await websocket.close(code=1008)
+        except Exception:
+            pass
+
     @api.websocket("/ws/live-recitation")
     async def ws_live(websocket: WebSocket) -> None:
-        subject, _why = authenticate(getattr(websocket, "headers", None) or {})
+        subject, why, detail = authenticate_ex(getattr(websocket, "headers", None) or {})
         if subject is None:
-            # refused during the handshake: nothing is accepted, no model is touched, nothing is billed
-            await websocket.close(code=1008)
+            await deny_handshake(websocket, why, detail)
             return
         await websocket.accept()
-        cfg, _bad = parse_session_params(websocket.query_params)
+        cfg, bad = parse_session_params(websocket.query_params)
         slot_err = None if cfg is None else limiter.acquire(subject)
         if cfg is None or slot_err is not None:
+            print("[rafiq][ws-reject] reason=%s stage=after_accept sub=%s" % (bad if cfg is None else slot_err, _logsafe(subject)), flush=True)
             try:
                 await websocket.send_text(_dumps(public_error("bad_request" if cfg is None else slot_err)))
                 await websocket.close(code=1008 if cfg is None else 1013)
             except Exception:
                 pass
             return
+        print("[rafiq][ws-open] sub=%s sura=%s aya=%s strictness=%s active=%d" % (
+            _logsafe(subject), cfg["sura"], cfg["aya"], cfg["strictness"], limiter.active), flush=True)
         state: Dict[str, Any] = {"engine": None, "last_rx": time.monotonic(), "end": "final"}
         wake, stop_evt = asyncio.Event(), asyncio.Event()
         send_lock = asyncio.Lock()
@@ -3534,7 +3800,11 @@ def build_fastapi_app(runtime: ModelRuntime = RUNTIME):
 # ==============================================================================
 MODAL_CPU = (0.125, 2.0)                                   # (reserved, burst limit) physical cores
 MODAL_MEMORY = (int(os.environ.get("RAFIQ_MEM_MIB", "1536")), int(os.environ.get("RAFIQ_MEM_LIMIT_MIB", "4096")))
-MODAL_SCALEDOWN_S = 2
+# Idle time after the LAST open socket before Modal shuts the container down (billed while idle, so keep it short).
+# 20 s outlives the client's 1 s / 2 s / 4 s reconnect back-off (a retry finds the same warm container) and the server's
+# own 8 s idle cut (IDLE_KILL_S), and is still cheap. No keep-warm pings, no min_containers, no warm-up traffic: the
+# container simply goes away after this window and the next session restores from the memory snapshot.
+MODAL_SCALEDOWN_S = max(2, min(600, int(os.environ.get("RAFIQ_SCALEDOWN_S", "20"))))
 MODAL_MAX_INPUTS = 16
 MODAL_TARGET_INPUTS = int(os.environ.get("RAFIQ_TARGET_INPUTS", "1"))   # inference is CPU-bound: 1 live session per core budget
 SERVER_MODE = os.environ.get("RAFIQ_SERVER", "uvicorn")    # "uvicorn" (compression off, no access log) | "asgi"
@@ -3543,19 +3813,22 @@ if modal is not None:
     app = modal.App(APP_NAME)
 
     def download_muaalem_weights() -> None:
-        """Runs once at image build time so cold starts do not download the 2 GB model."""
+        """Runs ONCE at image build time (Modal caches the resulting layer): downloads the 2 GB model so cold starts never
+        do, and quantises it to INT8 once so start-up never has to (see build_prequantized_artifact)."""
         import torch
         from quran_muaalem import Muaalem
         from quran_transcript import Aya, MoshafAttributes, quran_phonetizer
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = torch.bfloat16 if device == "cuda" else torch.float32
-        Muaalem(model_name_or_path=MODEL_ID, device=device, dtype=dtype)
+        m = Muaalem(model_name_or_path=MODEL_ID, device=device, dtype=dtype)
         moshaf = MoshafAttributes(
             rewaya="hafs", madd_monfasel_len=4, madd_mottasel_len=4,
             madd_mottasel_waqf=4, madd_aared_len=4,
         )
         quran_phonetizer(Aya(2, 255).get().uthmani, moshaf, remove_spaces=True)
+        if device == "cpu":                          # dynamic INT8 is CPU-only; a GPU image keeps the bf16 model
+            build_prequantized_artifact(m)
 
     muaalem_image = (
         modal.Image.debian_slim(python_version="3.11")
@@ -3578,11 +3851,12 @@ if modal is not None:
             "soundfile",
             "numpy",
         )
-        .run_function(download_muaalem_weights)
+        # 8 GiB: fp32 model (2.4 GB) + its INT8 copy + the copy reloaded for verification are alive at the same time.
+        .run_function(download_muaalem_weights, cpu=2.0, memory=8192, timeout=1800)
     )
 
-    # lowest bill: fractional CPU reservation with burst, scale to zero after 2 s, default (pre-emptible) capacity,
-    # no region pinning (both would multiply the price).
+    # lowest bill: fractional CPU reservation with burst, scale to zero MODAL_SCALEDOWN_S (20 s) after the last socket
+    # closes, default (pre-emptible) capacity, no region pinning (both would multiply the price).
     _cls_kwargs: Dict[str, Any] = dict(
         image=muaalem_image, cpu=MODAL_CPU, memory=MODAL_MEMORY, scaledown_window=MODAL_SCALEDOWN_S, timeout=900,
     )
@@ -3623,8 +3897,11 @@ if modal is not None:
     class Fastapi:
         @_enter_hook()
         def load(self) -> None:
-            """Executed once while the snapshot is created: load (and hybrid-quantise) the model, warm it up,
-            return freed memory to the kernel and freeze the heap. Restored containers start with everything ready."""
+            """Executed once while the snapshot is created: load the model (its INT8 encoder was built at image-build
+            time and is only deserialised here), run ONE dummy inference so lazy initialisation is part of the snapshot,
+            return freed memory to the kernel and freeze the heap. Restored containers start with everything ready.
+            This is not a keep-warm mechanism: nothing is ever called on a schedule or before a session starts."""
+            log_boot_banner("snapshot")
             try:
                 RUNTIME.ensure_loaded()
                 RUNTIME.warmup()
@@ -3634,6 +3911,7 @@ if modal is not None:
 
         @_serve_decorator()
         def asgi_app(self) -> Any:
+            log_boot_banner("serve")                 # after a snapshot restore: must show the same secret fingerprint as "snapshot"
             api = build_fastapi_app(RUNTIME)
             if SERVER_MODE == "asgi" or not hasattr(modal, "web_server"):
                 return api

@@ -358,6 +358,135 @@ async def ws_tests():
 
 asyncio.run(ws_tests())
 
+# ============================================================================== 4b. refused handshakes: the exact cause is logged, the client gets a reason
+import contextlib, io
+
+
+class DenialWS(FakeWS):
+    """FakeWS on a server that supports the ASGI WebSocket Denial Response extension (Starlette >= 0.37 + a recent uvicorn)."""
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.denial = None
+
+    async def send_denial_response(self, response):
+        self.denial = response
+
+
+class NoExtWS(FakeWS):
+    async def send_denial_response(self, response):
+        raise RuntimeError("The server doesn't support the Websocket Denial Response extension.")
+
+
+def fresh_log_window(n=30):
+    M._REJECT_LOG = M.RateWindow(n, 60.0)
+    M._REJECT_SUPPRESSED[0] = 0
+
+
+async def captured(h, ws):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        await asyncio.wait_for(h(ws), 5)
+    return buf.getvalue()
+
+
+def reject_lines(out):
+    return [l for l in out.splitlines() if l.startswith("[rafiq][ws-reject]")]
+
+
+async def diag_tests():
+    os.environ["RAFIQ_AUTH_SECRET"] = SECRET
+    fp = M.secret_fingerprint(SECRET)
+    check("fingerprint: 8 hex chars, deterministic, and not the secret", len(fp) == 8 and fp == M.secret_fingerprint(SECRET) and SECRET not in fp and M.secret_fingerprint(None) == "none")
+    rt = FakeRuntime(SPEECH); app, h = handler_of(rt)
+
+    # --- no Authorization header at all (client never sent one / a proxy stripped it)
+    fresh_log_window(); ws = DenialWS(headers={"user-agent": "okhttp/4.12.0", "host": "x"}); out = await captured(h, ws)
+    L = reject_lines(out)
+    check("missing token: exactly ONE log line carrying reason, auth mode, secret fingerprint, and the header NAMES that arrived",
+          len(L) == 1 and "reason=missing_token" in L[0] and "auth_mode=token" in L[0] and "server_secret_fp=" + fp in L[0]
+          and "has_authorization=0" in L[0] and "headers=[host,user-agent]" in L[0] and "ua=okhttp/4.12.0" in L[0], L)
+    check("missing token: HTTP 403 body tells the app WHY (token_missing); nothing accepted, model untouched",
+          ws.denial is not None and ws.denial.status_code == 403 and dict(ws.denial) == {"error": "unauthorized", "reason": "token_missing"}
+          and not ws.accepted and not ws.sent and rt.calls == {"ensure_loaded": 0, "get_ref": 0, "recognize": 0}, (ws.denial, rt.calls))
+
+    # --- token signed with ANOTHER secret (the classic deployment mistake): logged as `signature`, token + secrets never printed
+    other = "z" * 40
+    bad_tok = M.issue_token(other, "alice", 3600)
+    fresh_log_window(); ws = DenialWS(headers={"authorization": "Bearer " + bad_tok}); out = await captured(h, ws)
+    L = reject_lines(out)
+    check("wrong secret: reason=signature, token shape + length logged",
+          len(L) == 1 and "reason=signature" in L[0] and "has_authorization=1" in L[0] and "scheme=Bearer" in L[0]
+          and "token_len=%d" % len(bad_tok) in L[0] and "token_hint=shape_ok" in L[0], L)
+    check("wrong secret: neither the token, its signature, the server secret nor the other secret is ever printed",
+          bad_tok not in out and bad_tok.split(".")[2] not in out and bad_tok.split(".")[1] not in out and SECRET not in out and other not in out)
+    check("wrong secret: the client is told 'token_invalid' (no oracle between signature / malformed / scope)",
+          dict(ws.denial) == {"error": "unauthorized", "reason": "token_invalid"})
+
+    # --- expired / issued by a clock that is ahead
+    fresh_log_window(); ws = DenialWS(headers={"authorization": "Bearer " + M.issue_token(SECRET, "alice", 5, now=1000)}); out = await captured(h, ws)
+    check("expired: reason=expired with how long ago (server log only); the client is told token_expired",
+          "reason=expired" in out and "sub=alice_expired" in out and dict(ws.denial)["reason"] == "token_expired", out[:300])
+    import time as _t
+    fresh_log_window(); ws = DenialWS(headers={"authorization": "Bearer " + M.issue_token(SECRET, "alice", 3600, now=int(_t.time()) + 10_000)}); out = await captured(h, ws)
+    check("issuer clock ahead of the server: logged with the explanation (it used to be an opaque 'malformed')",
+          "reason=malformed" in out and "clock_of_the_machine_that_issued_the_token_is_ahead" in out, out[:400])
+
+    # --- copy / paste accidents are recognised from the SHAPE of the token
+    good_tok = tok("alice")
+    for label, header, hint in (("wrapped in quotes", 'Bearer "%s"' % good_tok, "wrapped_in_quotes"),
+                                ("double Bearer", "Bearer Bearer " + good_tok, "double_bearer_prefix"),
+                                ("inner space", "Bearer " + good_tok[:20] + " " + good_tok[20:], "contains_whitespace"),
+                                ("not an rq1 token", "Bearer abc.def.ghi", "not_an_rq1_token")):
+        fresh_log_window(); ws = DenialWS(headers={"authorization": header}); out = await captured(h, ws)
+        check("paste mistake (%s) is named in the log: token_hint=%s" % (label, hint), "token_hint=" + hint in out and ws.denial is not None and good_tok not in out, out[:300])
+
+    # --- the server has no usable secret (Modal secret not attached / stale environment)
+    os.environ.pop("RAFIQ_AUTH_SECRET")
+    fresh_log_window(); ws = DenialWS(headers=auth()); out = await captured(h, ws)
+    check("secret missing in the container: reason=auth_not_configured, auth_mode=closed, fingerprint none, and the log says the variable is NOT set",
+          "reason=auth_not_configured" in out and "auth_mode=closed" in out and "server_secret_fp=none" in out and "NOT_set" in out
+          and dict(ws.denial)["reason"] == "server_auth_unconfigured", out[:400])
+    os.environ["RAFIQ_AUTH_SECRET"] = "short"
+    fresh_log_window(); ws = DenialWS(headers=auth()); out = await captured(h, ws)
+    check("secret present but shorter than 32 characters: the log says so (it is treated as 'not configured')", "shorter_than_32" in out, out[:300])
+    os.environ["RAFIQ_AUTH_SECRET"] = SECRET
+
+    # --- servers without the denial extension (older Starlette / uvicorn): v14.6 behaviour, but now logged
+    for cls, name in ((NoExtWS, "extension unsupported"), (FakeWS, "no send_denial_response at all")):
+        fresh_log_window(); ws = cls(); out = await captured(h, ws)
+        check("fallback (%s): plain close(1008) before accept = bare 403, and the cause is still logged" % name,
+              ws.close_code == 1008 and not ws.accepted and "reason=missing_token" in out, (ws.close_code, out[:200]))
+
+    # --- log hygiene
+    fresh_log_window(); forged_ua = "evil\r\n[rafiq][ws-reject] reason=FORGED auth_mode=token"
+    ws = DenialWS(headers={"user-agent": forged_ua}); out = await captured(h, ws)
+    check("a header value cannot forge a second log line (CR/LF/space are neutralised)", len(reject_lines(out)) == 1 and "FORGED" in out and out.count("\n") == 1, out)
+    fresh_log_window(3); outs = ""
+    for _ in range(5):
+        outs += await captured(h, DenialWS())
+    check("log flood: at most 3 lines per window are written (scanner cannot fill the log)", len(reject_lines(outs)) == 3, len(reject_lines(outs)))
+    M._REJECT_LOG = M.RateWindow(3, 60.0)
+    out = await captured(h, DenialWS())
+    check("...and the next line reports how many were dropped", "(+2_more" in out or "(+2 more refusals not logged)" in out, out[-120:])
+    fresh_log_window()
+
+    # --- accepted session and post-accept refusals are visible too
+    rt = FakeRuntime(SPEECH); app, h = handler_of(rt)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        await short_session(h, FakeWS(headers=auth("alice")), 1.0)
+    out = buf.getvalue()
+    check("accepted session logs one [ws-open] line (subject, verse, strictness) and never the token",
+          out.count("[rafiq][ws-open]") == 1 and "sub=alice" in out and "sura=2 aya=255" in out and tok("alice") not in out, out[:300])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        await asyncio.wait_for(h(FakeWS(qp={"sura_idx": "999"}, headers=auth())), 5)
+    check("bad parameters after accept are logged with their reason", "reason=bad_sura stage=after_accept" in buf.getvalue(), buf.getvalue()[:200])
+
+
+asyncio.run(diag_tests())
+os.environ["RAFIQ_AUTH_SECRET"] = SECRET
+
 # ============================================================================== 5. HTTP routes: health / admin / debug
 async def route_tests():
     detail = {"status": "ok", "engine": M.ENGINE_NAME, "model": "obadx/secret-model-id", "diag": {"x": 1}, "load_error": "Traceback /srv/app.py line 3", "quant": {"q": 1}}

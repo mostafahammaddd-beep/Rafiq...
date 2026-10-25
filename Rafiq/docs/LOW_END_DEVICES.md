@@ -8,7 +8,7 @@ to build the app. Items are labelled **VERIFIED** (read in the repo), **PROPOSED
   instead), keeps 250 ms before speech and 500 ms after, sends ~160 ms frames over one OkHttp WebSocket.
 * Runs **no neural inference**. RAM/CPU on the phone is therefore the UI (Jetpack Compose), the audio loop and the socket.
 * Build config: `minSdk 24` (Android 7.0), `targetSdk 34`, `compileSdk 34`.
-* No offline mode: after 8 failed reconnects it shows a connection error and gives no corrections (this is the correct
+* No offline mode: after 3 failed reconnects (back-off 1 s, 2 s, 4 s; at most 10 retries in a whole session) it shows a connection error and gives no corrections (this is the correct
   behaviour when it cannot assess reliably — it never invents a correction).
 
 ## Proposed minimum device (PROPOSED — UNVERIFIED)

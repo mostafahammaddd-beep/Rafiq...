@@ -63,7 +63,6 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
 
     private var session: RecitationSession? = null
     private var player: MediaPlayer? = null
-    private var warming = false
     private var released = false
     private var serverTracked = -1
     private var serverCommitted = 0
@@ -80,41 +79,6 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
     /** وضع التوفير: الخادم المدفوع بالثانية يبقى نائماً حتى يطلب المستخدم إيقاظه. */
     fun markSleeping() {
         serverState = 3
-    }
-
-    fun warmUp() {
-        if (warming || released) return
-        warming = true
-        serverState = 0
-        val url = RecitationConfig.healthUrl(appContext)
-        Thread {
-            var ok = false
-            var tries = 0
-            while (!ok && tries < 120 && !released) {
-                try {
-                    val client = Net.client.newBuilder().readTimeout(120, TimeUnit.SECONDS).build()
-                    client.newCall(Request.Builder().url(url).build()).execute().use { r ->
-                        val body = r.body?.string() ?: ""
-                        val st = JSONObject(body).optString("status")
-                        ok = r.isSuccessful && st == "ok"
-                        if (st == "error") tries = 1000
-                    }
-                } catch (e: Exception) {
-                    ok = false
-                }
-                tries++
-                if (!ok && !released && tries < 120) {
-                    try {
-                        Thread.sleep(2500)
-                    } catch (_: InterruptedException) {
-                    }
-                }
-            }
-            main.post {
-                warming = false
-                if (!released) serverState = if (ok) 1 else 2
-            }
-        }.start()
     }
 
     private fun afterSession() {
@@ -340,14 +304,13 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
 
     fun saveServerUrl(url: String) {
         RecitationConfig.saveServerBaseUrl(appContext, url)
-        serverState = 0
-        warming = false
-        warmUp()
+        serverState = 3           // نائم: لا نتصل بالخادم الجديد إلا لحظة الضغط على التسجيل (لا استدعاءات تسخين)
     }
 
-    fun retryServer() {
-        warming = false
-        warmUp()
+    /** يمسح حالة «لا اتصال» فقط. لا شبكة هنا: الاتصال يبدأ لحظة الضغط على زر التسجيل وحدها. */
+    fun resetServerState() {
+        serverState = 3
+        message = ""
     }
 
     /** المستخدم يخبرنا أن حكم الخادم على كلمة كان خاطئاً: kind = missed | wrong_flag */
